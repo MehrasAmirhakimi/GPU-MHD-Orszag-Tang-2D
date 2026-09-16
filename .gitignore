@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+# run output, regenerate with run_ot.py
+ot_diagnostics.csv
+*.npz
+!ot_state.npz
