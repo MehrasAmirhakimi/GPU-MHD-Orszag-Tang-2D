@@ -1,11 +1,17 @@
-# gpu-mhd2d
+# GPU-MHD-Orszag-Tang-2D
 
 A 2D compressible resistive MHD solver, written first in NumPy as a reference
-and then ported to CUDA. This repository is the reference stage.
+and then ported to C++ and CUDA.
 
 The point of the reference is not speed. It is to have a correct, readable
 implementation whose output the GPU version can be diffed against field by
 field, so that a disagreement in the port is unambiguously a bug in the port.
+
+**Status:** stage 2 of 4. The CUDA port is written, and its code reproduces
+the NumPy reference to round-off when executed on a CPU (see
+[The CUDA port](#the-cuda-port)). The run on real GPU hardware is in the
+Colab notebook:
+[![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/MehrasAmirhakimi/GPU-MHD-Orszag-Tang-2D/blob/main/notebooks/colab_gpu_port.ipynb)
 
 ## Equations
 
@@ -89,7 +95,67 @@ per cent, so the dissipated energy is going where it should.
 
 ![Orszag-Tang](ot_pressure.png)
 
+## The CUDA port
+
+```
+cuda/mhd_core.h        the physics, written once: stencils, equation of state,
+                       right-hand side at one grid point
+cuda/backend_cuda.cu   GPU memory, kernels, and the reduction for the time step
+cuda/backend_cpu.cpp   the same point functions in plain loops (OpenMP)
+cuda/main.cpp          Orszag-Tang driver; one command line for both backends
+compare.py             field-by-field check against ot_state.npz
+notebooks/             build, validate and time on a Colab GPU
+```
+
+Every kernel body is a call into `mhd_core.h`, the same functions the CPU
+backend loops over, so the physics exists in one place. What `backend_cuda.cu`
+adds is only what is specific to the GPU: device memory, launch shapes, and a
+block reduction for the time step.
+
+This is the deliberately naive version: global memory only, one thread per
+grid point, one kernel per sweep. Per RK stage, four sweeps build the shock
+viscosity (div u, 3x3 max, two smoothing passes), one computes the right-hand
+side, one applies the update. Before each step, a reduction kernel writes
+per-block maxima of the signal speed and of the shock viscosity, and the host
+turns them into dt. Everything is float64.
+
+The C++ keeps NumPy's order of floating-point operations wherever it matters,
+so the two codes differ only by rounding, and `compare.py` can use a tight
+tolerance.
+
+**What has been checked.** Orszag-Tang, 256^2, to t = 0.5, worst field
+difference against the NumPy state, normalised by the size of each field:
+
+| run | worst difference |
+| --- | --- |
+| C++ CPU backend | 8.0e-14 |
+| C++ CPU backend, fused multiply-add everywhere, as on a GPU | 9.6e-14 |
+| CUDA backend, converted with `hipify-perl` and executed on the CPU by [HIP-CPU](https://github.com/ROCm/HIP-CPU) | 8.0e-14 |
+
+The third row runs the actual kernels, launch configurations and reduction
+from `backend_cuda.cu`, not a rewrite of them. `hipify-perl` converted the
+file with no manual edits, which is also the evidence that it is
+hipify-clean and would build for AMD GPUs.
+
+That third run needed `DEBUG_SYNC=1`, a synchronisation after every launch.
+Without it, the emulator disagreed at 1e-1, although each kernel on its own
+matched the CPU loops bit for bit. The cause is in HIP-CPU, not in the port:
+its default stream can start a queued kernel before the previous one has
+finished, and a real CUDA default stream never does.
+
+The device code compiles for `sm_75` (T4), `sm_80` (A100) and `sm_89` (L4).
+With clang's CUDA front end and NVIDIA's `ptxas`, the right-hand-side kernel
+uses 208 registers per thread on `sm_75` with no spills. That allows one
+256-thread block per multiprocessor on a T4, which is one of the first things
+the optimisation stage has to deal with. nvcc may allocate differently.
+
+**Still to do for stage 2:** the same comparison on real GPU hardware. The
+notebook does it in one click, then times NumPy, the C++ CPU backend and the
+GPU on the same machine.
+
 ## Running it
+
+Python reference:
 
 ```
 pip install numpy matplotlib
@@ -98,29 +164,54 @@ python test_convergence.py          # the three checks above
 python run_ot.py --nx 256 --tmax 0.5
 ```
 
-`run_ot.py` writes `ot_pressure.png`, `ot_diagnostics.csv` and `ot_state.npz`.
-The `.npz` is the regression target for the CUDA port: a short run to
-t = 0.5 is enough, and the two codes should agree to round-off for the first
-few hundred steps.
+`run_ot.py` writes `ot_pressure.png`, `ot_diagnostics.csv` and `ot_state.npz`
+into the current directory. The `ot_state.npz` in the repository root is the
+regression target for the port, so run `run_ot.py` from another directory
+if you do not want to overwrite it.
 
-## Performance baseline
+C++ and CUDA:
 
-NumPy, single core, float64: **1.04 microseconds per grid point per step** at
-256^2. That is the number the GPU version has to beat, and it is in the README
-so the comparison later is against something recorded rather than remembered.
+```
+cd cuda
+make cpu && ./mhd2d_cpu --nx 256 --tmax 0.5
+make gpu && ./mhd2d_gpu --nx 256 --tmax 0.5    # needs nvcc and an NVIDIA GPU
+cd ..
+python compare.py ot_state.npz cuda/ot_state_gpu.npy
+```
+
+`--steps N` runs a fixed number of steps instead of stopping at `--tmax`,
+which is what the timing runs use. `make gpu ARCH=sm_75` names the card when
+the build machine has none; `DEBUG_SYNC=1` reports a fault at the kernel that
+caused it.
+
+Or skip all of that and open the notebook in Colab.
+
+## Performance
+
+Same machine, same session, 256^2, to t = 0.5, float64:
+
+| implementation | us per point-step |
+| --- | --- |
+| NumPy, one core | 1.46 |
+| C++ CPU backend, OpenMP, 2 cores | 0.40 |
+
+On a 2-core Intel Xeon at 2.1 GHz. The NumPy figure was 1.04 in an earlier
+session on the same kind of cloud machine, which is why comparisons here are
+always made within one session: shared machines drift by tens of per cent
+from one day to the next. GPU timings will be added once the notebook has run
+on a named card.
 
 ## Where this is going
 
 1. ~~NumPy reference, validated~~
-2. CUDA port, global memory only, one kernel per RK stage. Target: results
-   matching the reference to round-off. Not fast yet.
-3. Shared-memory tiling for the stencils, fused RK stages, host transfers cut
-   to the output cadence. Report achieved bandwidth against the card's peak,
-   since a stencil code is bandwidth-bound and that ratio is what matters.
+2. CUDA port, global memory only, one kernel per sweep. Matches the
+   reference to round-off on CPU execution; GPU confirmation via the
+   notebook.
+3. Shared-memory tiling for the stencils, fused sweeps, lower register
+   pressure in the right-hand side, host transfers cut to the output cadence.
+   Report achieved bandwidth against the card's peak, since a stencil code is
+   bandwidth-bound and that ratio is what matters.
 4. Timing table across grid sizes, CPU baseline against GPU.
-
-The CUDA is written to stay hipify-clean, with no warp-level intrinsics, so
-it ports to HIP and therefore to AMD hardware.
 
 ## What this does not do
 
@@ -136,3 +227,8 @@ Honest list, so nobody has to read the source to find out:
   periodic vector potential. Carrying the background separately from the
   evolved potential would fix this and is the obvious next test to add.
 - No self-gravity, no rotation, no radiative transfer.
+- The port is float64 throughout. Consumer and inference GPUs run float64 at
+  a small fraction of their float32 rate (1/32 on a T4), so a float32 build is
+  an obvious later option. It would need its own tolerance in `compare.py`.
+- Setting dt copies the per-block maxima to the host every step, which ties
+  host and device together once per step.

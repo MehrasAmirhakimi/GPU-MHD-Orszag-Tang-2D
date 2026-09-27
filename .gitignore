@@ -5,3 +5,10 @@ __pycache__/
 ot_diagnostics.csv
 *.npz
 !ot_state.npz
+# C++ / CUDA builds and their output
+cuda/mhd2d_cpu
+cuda/mhd2d_gpu
+cuda/*.o
+*.npy
+ot_diagnostics_*.csv
+timing_numpy/
