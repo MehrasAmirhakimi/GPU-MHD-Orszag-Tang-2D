@@ -7,10 +7,11 @@ The point of the reference is not speed. It is to have a correct, readable
 implementation whose output the GPU version can be diffed against field by
 field, so that a disagreement in the port is unambiguously a bug in the port.
 
-**Status:** stage 2 of 4. The CUDA port is written, and its code reproduces
-the NumPy reference to round-off when executed on a CPU (see
-[The CUDA port](#the-cuda-port)). The run on real GPU hardware is in the
-Colab notebook:
+**Status:** stage 2 of 4 done. The CUDA port reproduces the NumPy reference
+to round-off on a Tesla T4 (worst field difference 7.8e-14) and runs about
+100 times faster than NumPy on the same machine. Next is optimisation. The
+notebook repeats the whole check and the timings in one click, and the copy
+in the repository is saved with the outputs of that run:
 [![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/MehrasAmirhakimi/GPU-MHD-Orszag-Tang-2D/blob/main/notebooks/colab_gpu_port.ipynb)
 
 ## Equations
@@ -131,27 +132,28 @@ difference against the NumPy state, normalised by the size of each field:
 | C++ CPU backend | 8.0e-14 |
 | C++ CPU backend, fused multiply-add everywhere, as on a GPU | 9.6e-14 |
 | CUDA backend, converted with `hipify-perl` and executed on the CPU by [HIP-CPU](https://github.com/ROCm/HIP-CPU) | 8.0e-14 |
+| **CUDA backend on a Tesla T4** (Colab, CUDA 12.8, nvcc with fused multiply-add) | **7.8e-14** |
 
-The third row runs the actual kernels, launch configurations and reduction
+On the T4 the run takes the same 139 steps as NumPy, ends at the same final
+dt, and reports the same energy drift (6.796e-06) and mass drift (3.797e-09).
+
+The HIP-CPU row runs the actual kernels, launch configurations and reduction
 from `backend_cuda.cu`, not a rewrite of them. `hipify-perl` converted the
 file with no manual edits, which is also the evidence that it is
 hipify-clean and would build for AMD GPUs.
 
-That third run needed `DEBUG_SYNC=1`, a synchronisation after every launch.
+That run needed `DEBUG_SYNC=1`, a synchronisation after every launch.
 Without it, the emulator disagreed at 1e-1, although each kernel on its own
 matched the CPU loops bit for bit. The cause is in HIP-CPU, not in the port:
 its default stream can start a queued kernel before the previous one has
-finished, and a real CUDA default stream never does.
+finished, and a real CUDA default stream never does. The T4 run above used
+the normal build, without `DEBUG_SYNC`.
 
 The device code compiles for `sm_75` (T4), `sm_80` (A100) and `sm_89` (L4).
 With clang's CUDA front end and NVIDIA's `ptxas`, the right-hand-side kernel
 uses 208 registers per thread on `sm_75` with no spills. That allows one
 256-thread block per multiprocessor on a T4, which is one of the first things
 the optimisation stage has to deal with. nvcc may allocate differently.
-
-**Still to do for stage 2:** the same comparison on real GPU hardware. The
-notebook does it in one click, then times NumPy, the C++ CPU backend and the
-GPU on the same machine.
 
 ## Running it
 
@@ -188,30 +190,45 @@ Or skip all of that and open the notebook in Colab.
 
 ## Performance
 
-Same machine, same session, 256^2, to t = 0.5, float64:
+One Colab machine, one session, float64, from the notebook: a Tesla T4 and
+two CPU cores.
 
-| implementation | us per point-step |
-| --- | --- |
-| NumPy, one core | 1.46 |
-| C++ CPU backend, OpenMP, 2 cores | 0.40 |
+| implementation | grid | us per point-step | Mpoint-steps/s | vs NumPy |
+| --- | --- | --- | --- | --- |
+| NumPy, one core | 256^2 | 2.19 | 0.5 | 1x |
+| C++ CPU backend, OpenMP | 256^2 | 1.05 | 1.0 | 2x |
+| C++ CPU backend, OpenMP | 512^2 | 1.35 | 0.7 | 2x |
+| CUDA, Tesla T4 | 256^2 | 0.0335 | 29.9 | 65x |
+| CUDA, Tesla T4 | 512^2 | 0.0206 | 48.4 | 106x |
+| CUDA, Tesla T4 | 1024^2 | 0.0206 | 48.5 | 106x |
+| CUDA, Tesla T4 | 2048^2 | 0.0207 | 48.3 | 106x |
 
-On a 2-core Intel Xeon at 2.1 GHz. The NumPy figure was 1.04 in an earlier
-session on the same kind of cloud machine, which is why comparisons here are
-always made within one session: shared machines drift by tens of per cent
-from one day to the next. GPU timings will be added once the notebook has run
-on a named card.
+The last column compares each run with the NumPy run at 256^2.
+
+From 512^2 up, the GPU throughput is flat at about 48 million point-steps per
+second, so something on the card is saturated. At 256^2 it is lower, most
+likely because 65,536 points are too few to keep the card busy while each step
+also waits for the time-step maxima to come back to the host. A T4 runs
+float64 at 1/32 of its float32 rate, so whether the plateau is set by
+arithmetic or by memory bandwidth is the first thing stage 3 has to measure,
+before changing anything.
+
+These numbers only compare within the session. On the 2-core development
+machine the same C++ run takes 0.40 us per point-step and NumPy takes 1.46,
+and even that machine gave NumPy 1.04 on another day. Shared cloud machines
+drift by tens of per cent from one day to the next.
 
 ## Where this is going
 
 1. ~~NumPy reference, validated~~
-2. CUDA port, global memory only, one kernel per sweep. Matches the
-   reference to round-off on CPU execution; GPU confirmation via the
-   notebook.
-3. Shared-memory tiling for the stencils, fused sweeps, lower register
-   pressure in the right-hand side, host transfers cut to the output cadence.
-   Report achieved bandwidth against the card's peak, since a stencil code is
-   bandwidth-bound and that ratio is what matters.
-4. Timing table across grid sizes, CPU baseline against GPU.
+2. ~~CUDA port, global memory only, one kernel per sweep~~. Matches NumPy
+   to 7.8e-14 on a Tesla T4.
+3. Profile the T4 run to find whether float64 arithmetic or memory bandwidth
+   sets the plateau. Then shared-memory tiling for the stencils, fused
+   sweeps, lower register pressure in the right-hand side, and host
+   transfers cut to the output cadence. Report achieved bandwidth and
+   arithmetic rate against the card's peaks.
+4. Timings before and after stage 3 on more than one card.
 
 ## What this does not do
 
